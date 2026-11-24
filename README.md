@@ -1,50 +1,85 @@
-# W3ManaBars
+# W3HideFullHP
 
-Mana bars under the unit health bars for **Warcraft III 1.26a, 1.27b and 1.28.5**, as in the later patches.
+Hides a unit's health bar while its HP is above a threshold, for **Warcraft III 1.27b** (Game.dll 1.27.1.7085).
 
-- Every unit with a mana pool (heroes, casters) gets a blue mana bar right under its health bar, across the same width. Units without mana get none.
-- The bar is the game's own mana bar (the one it uses in the console), placed over units. It shows and hides with the health bar and follows it everywhere.
-- With [W3TrueWidescreen](https://github.com/Hr0ffT/W3TrueWidescreen) the mana bars behave like the health bars at the console: drawn under it, moved beside it, hidden behind it.
+- A unit at full health shows no health bar at all. Damage it and the bar appears; heal it back and the bar
+  disappears again. Default threshold: **95 %**.
+- Only the drawing changes: the mod never takes a bar away from the game's own rules. Selection, the Alt toggle,
+  hover, "always show health bars", fog of war and death all keep working — the mod only ever adds a reason to
+  *hide* a bar, never a reason to show one.
+- Everything happens in memory while the game runs. No game files are modified.
 
-Everything happens in memory while the game runs. No game files are modified.
+This is a fork of [W3ManaBars](https://github.com/Hr0ffT/W3ManaBars) by [Hr0ffT](https://github.com/Hr0ffT),
+which draws mana bars under the health bars. All of the hook plumbing comes from there; the mana bar feature has
+been removed.
 
 ## Requirements
 
-- Warcraft III 1.26a (Game.dll 1.26.0.6401), 1.27b (Game.dll 1.27.1.7085) or 1.28.5 (Game.dll 1.28.5.7680). The mod checks the version and does nothing on any other patch.
+- Warcraft III 1.27b, Game.dll **1.27.1.7085**. The mod checks the version and does nothing on any other patch.
 
 ## Installation
 
-1. Copy `W3ManaBars.mix` and `W3ManaBars.ini` into the Warcraft III folder, next to `war3.exe`.
+1. Copy `W3HideFullHP.mix` and `W3HideFullHP.ini` into the Warcraft III folder, next to `war3.exe`.
 2. Start the game. The `.mix` is loaded automatically, no launcher needed.
 
-Works alongside other `.mix` mods, for example [W3TrueWidescreen](https://github.com/Hr0ffT/W3TrueWidescreen), [W3MinimapTweaks](https://github.com/Hr0ffT/W3MinimapTweaks) and [W3MultislotQuickSave](https://github.com/Hr0ffT/W3MultislotQuickSave).
+Works alongside other `.mix` mods, for example [W3TrueWidescreen](https://github.com/Hr0ffT/W3TrueWidescreen),
+[W3MinimapTweaks](https://github.com/Hr0ffT/W3MinimapTweaks) and
+[W3MultislotQuickSave](https://github.com/Hr0ffT/W3MultislotQuickSave).
 
-To uninstall, delete `W3ManaBars.mix` and `W3ManaBars.ini`.
+To uninstall, delete `W3HideFullHP.mix` and `W3HideFullHP.ini`.
 
 ## Settings
 
-All in `W3ManaBars.ini`:
+All in `W3HideFullHP.ini`:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `Height` | 100 | Height of the mana bar in percent of the health bar's height (20..300) |
-| `ManaColor` | 2F6BFF | Colour of the mana bar as `RRGGBB`. The game's own mana blue (`0000FF`) is hard to tell from the black of the empty part |
-| `Debug` | 0 | 1 = write `W3ManaBars.log` next to the game (for bug reports) |
+| `HideAbovePercent` | 95 | Hide a bar while HP is above this percentage (1..100). A unit at *exactly* this percentage still shows its bar, i.e. the comparison is strict `>`. `100` = never hide |
+| `Debug` | 0 | 1 = write `W3HideFullHP.log` next to the game (bar show/suppress counters every 3 s, for bug reports) |
+
+A missing `.ini`, a missing key or an unreadable value falls back to the default. Values outside 1..100 are
+clamped, and the clamp is logged when `Debug=1`.
 
 ## How it works
 
-The health bars over units are `CStatBar` frames. A `CStatBar` has a type: the small health bar over units is one of them, the small mana bar (`SimpleManaBarConsoleSmall`) another, which the game never puts over units. Every frame the game binds each shown health bar to its unit. When the unit has a mana pool, the mod makes a mana bar as a child of the health bar, anchored right under it and bound to the same unit. As a child it shows, hides and moves with the health bar on its own.
+The health bars over units are `CStatBar` frames; the small health bar over a unit is bar type 5. Every frame the
+game walks its health bar list and calls `CStatBar::Show` on each bar — once when the bar is not shown yet, and
+again on the "already shown" path. `Show` is therefore the one place where "this bar should be visible" is turned
+into "this bar is visible", and it is called on every bar on every frame.
+
+The mod hooks `Show`. For a unit health bar it reads the same HP fraction the game uses to fill the bar
+(`life / max life`, the same two unit fields the JASS `GetUnitLife` / `GetUnitMaxLife` states read) and, if that
+fraction is above the threshold, it refuses the show and hides the bar the way the game itself hides one
+(`WANT` = 0 plus the game's own `Hide`). Otherwise it falls straight through to the game's `Show`.
+
+Because this is a per-frame, stateless decision:
+
+- the bar comes back on the first frame the unit drops to or below the threshold;
+- nothing is cached per bar, so a bar rebound to another unit, a reused frame, a dying or removed unit cannot
+  leave stale state behind;
+- the mod never forces a bar visible, so all of the game's normal visibility rules still apply.
+
+## Building from source
+
+Requires a 32-bit MinGW (MSYS2 `mingw-w64-i686-gcc`). From the repository root:
+
+```
+i686-w64-mingw32-gcc -O2 -Wall -shared -static-libgcc -s -o W3HideFullHP.mix src/W3HideFullHP.c -lversion
+```
+
+The build is warning-free under `-Wall`. The result, `W3HideFullHP.mix`, is a 32-bit DLL that the game loads
+from its own folder.
 
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md).
 
-## Building from source
+## Credits
 
-```
-i686-w64-mingw32-gcc -O2 -Wall -shared -static-libgcc -s -o W3ManaBars.mix src/W3ManaBars.c -lversion
-```
+- [Hr0ffT](https://github.com/Hr0ffT) for [W3ManaBars](https://github.com/Hr0ffT/W3ManaBars), which this fork
+  is based on: the version check, the `CStatBar` vtable lookup and the hook plumbing are his work.
+- Blizzard Entertainment for Warcraft III.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). The original copyright notice is preserved.

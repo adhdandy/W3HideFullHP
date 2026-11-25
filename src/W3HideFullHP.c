@@ -5,23 +5,27 @@
 // Build: i686-w64-mingw32-gcc -O2 -Wall -shared -static-libgcc -s -o W3HideFullHP.mix src/W3HideFullHP.c -lversion
 //
 // The health bars over units are CStatBar frames. A CStatBar has a type: 5 is the small health bar over units.
-// Every frame the game walks its health bar list and, for each bar, either shows it (CStatBar::Show, vtable +0x68,
-// when it is not shown yet) or, when it is already shown, rebinds it to its unit and re-shows it (a no-op then).
-// So Show is called on every health bar on every frame, and it is the single place where "should this bar be
-// visible" is turned into "this bar is visible".
+// Every frame the game walks its health bar list and, for each bar, either shows it (CStatBar::Show, vtable +0x68)
+// or, when it is already shown, rebinds it to its unit and calls Show again (a no-op then). Show is therefore
+// called on every health bar on every frame.
 //
 // The mod hooks Show. When the bar is a unit health bar, it reads the same HP fraction the game uses to fill the
-// bar and, if that fraction is above the configured threshold, refuses the show and hides the bar if it is visible.
-// That only ever adds a hide condition: whenever the fraction is at or below the threshold the mod falls straight
-// through to the game's own Show, so all of the game's normal visibility rules (selection, Alt, hover, damage,
-// "always show health bars", fog, death) keep working. Because Show is evaluated on every bar on every frame the
-// bar comes back on the first frame the unit drops to or below the threshold. No per-bar state is kept, so a bar
-// rebound to another unit, a dying unit or a reused frame cannot leave anything stale behind.
+// bar and, if that fraction is above the configured threshold, makes the bar's own art transparent by setting the
+// frame alpha byte (+0x88) to 0. It deliberately does NOT hide the frame: the frame stays shown, so the game keeps
+// ticking it (the per-frame SetUnit bind still runs) and any child frames - such as the mana bars added by
+// W3ManaBars - keep being drawn. Hiding the frame instead would also hide its children, which is why the earlier
+// version of this mod made W3ManaBars' bars disappear.
+//
+// This only ever adds invisibility: the mod calls the game's own Show and only changes the alpha of the bar it was
+// asked to show. Whenever the fraction is at or below the threshold the alpha is put back to opaque, so all of the
+// game's normal visibility rules (selection, Alt, hover, damage, "always show health bars", fog, death) still
+// decide whether the bar is shown at all. Because Show runs on every bar on every frame the bar reappears on the
+// first frame the unit drops to or below the threshold. No per-bar state is kept, so a bar rebound to another
+// unit, a dying unit or a reused frame cannot leave anything stale behind.
 //
 // Verified against Game.dll 1.27.1.7085 (image base 0x6F000000):
-//   * CStatBar vtable at 0x6FABCE78. Slot +0x64 is Hide (0x6F10D410), slot +0x68 is Show (0x6F10DE60). Show
-//     returns 0 when WANT (+0x90) is 0 and does the show when it is set, so WANT=0 + returning 0 is exactly the
-//     "not visible" state the game itself produces.
+//   * CStatBar vtable at 0x6FABCE78. Slot +0x68 is Show (0x6F10DE60); Show returns early when WANT (+0x90) is 0,
+//     when the parent frame is not shown, or when the bar is already shown.
 //   * CStatBar::SetUnit (slot +0x74, 0x6F3DABA0) stores the widget it is handed in +0x154 and then switches on the
 //     bar type (+0x138). The jump table at 0x6F3DADA4 maps type 5 to 0x6F3DAC1F, which calls 0x6F3B6780 to get
 //     the fill fraction. That fraction is what the bar draws, so it is also what this mod compares.
@@ -29,8 +33,14 @@
 //     life is 0 it returns 0. Those are the same two slots the game's own GetUnitState uses (0x6F204050 ->
 //     0x6F687270, states 0 and 1), i.e. the JASS unit life and max life getters.
 //   * The per-frame bar updater (0x6F39591C) is the "show if not shown" path: it sets WANT=1 and calls Show for
-//     bars that are not shown, and calls Show again at 0x6F395AE0 for bars that are. It already suppresses the
-//     show by itself when a unit must not have a bar (0x6F39592C), which is why hooking Show is the right lever.
+//     bars that are not shown, and calls SetUnit/SetOther then Show at 0x6F395AE0 for bars that are.
+//   * The frame alpha is the byte at +0x88: the frame constructor (0x6F10C960) sets it to 0xFF, and
+//     CControl::SetAlpha (0x6F10DB10) writes it and then, for every art object in the frame's art list (+0xD8),
+//     calls the art's vtable +0x24 (0x6F113650) to recompute the art's effective alpha (+0x6C) as
+//     art alpha * frame alpha / 255. The draw path (art vtable +0x60, 0x6F1144F0) performs the same recompute
+//     before submitting the art, so the frame alpha is applied on the next draw. SetAlpha also recurses into child
+//     frames, which is exactly why the mod writes +0x88 directly instead of calling SetAlpha: the health bar must
+//     fade out while its child mana bar keeps its own alpha.
 #include <windows.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -39,6 +49,7 @@
 #include <stdlib.h>
 
 typedef uint32_t u32;
+typedef unsigned char u8;
 
 static u32 g_base, g_size;
 static FILE* g_log;
@@ -57,15 +68,17 @@ static const Addrs kAddrs[] = {
 };
 static const Addrs* A;
 
-#define OFS_WANT   0x90         // the bar should be visible
-#define OFS_SHOWN  0x94         // the bar is visible
+#define OFS_ALPHA  0x88         // frame alpha byte (0xFF opaque, 0 fully transparent)
+#define OFS_FILL   0x134        // the bar's fill art object
+#define OFS_BACK   0x144        // the bar's black backing art object
 #define OFS_TYPE   0x138        // bar type
 #define OFS_WIDGET 0x154        // the unit / widget the bar is bound to
 #define TYPE_HP_SMALL 5
 
 typedef u32    (__fastcall *Show_t)(u32 self, u32 edx);
 typedef float* (__fastcall *Frac_t)(u32 widget, u32 edx, float* out);
-static Show_t orig_Show, orig_Hide;
+typedef void   (__fastcall *ArtRefresh_t)(u32 art, u32 edx);
+static Show_t orig_Show;
 
 static void logf_(const char* f, ...)
 {
@@ -123,21 +136,42 @@ static float HealthFraction(u32 widget)
     return v;
 }
 
+// Set how opaque the bar's own art is (0 = invisible) without touching the frame itself or its children. The frame
+// alpha (+0x88) is what the engine's own SetAlpha writes; the art objects then recompute their effective alpha
+// (+0x6C) from it via art vtable +0x24 (0x6F113650). Calling that slot keeps the two art objects in sync even if
+// the draw path does not re-read the frame alpha.
+static void SetBarAlpha(u32 self, u8 a)
+{
+    u32 i, arts[2];
+    *(u8*)(self + OFS_ALPHA) = a;
+    arts[0] = *(u32*)(self + OFS_FILL);
+    arts[1] = *(u32*)(self + OFS_BACK);
+    for (i = 0; i < 2; i++) {
+        u32 art = arts[i];
+        if (art && IsGameObject(art))
+            ((ArtRefresh_t)*(u32*)(*(u32*)art + 0x24))(art, 0);
+    }
+}
+
 static u32 __fastcall Show_hook(u32 self, u32 edx)
 {
     if (g_threshold < 1.0f && *(u32*)(self + OFS_TYPE) == TYPE_HP_SMALL) {
+        u32 shown = orig_Show(self, edx);
         g_nCall++;
         if (g_log && GetTickCount() - g_diagTick > 3000) {
             g_diagTick = GetTickCount();
-            logf_("3 s: %u health bar shows, %u suppressed", g_nCall, g_nHide);
+            logf_("3 s: %u health bar shows, %u made transparent", g_nCall, g_nHide);
             g_nCall = g_nHide = 0;
         }
         if (HealthFraction(*(u32*)(self + OFS_WIDGET)) > g_threshold) {
             g_nHide++;
-            *(u32*)(self + OFS_WANT) = 0;
-            if (*(u32*)(self + OFS_SHOWN)) orig_Hide(self, 0);   // the game hid it the same way
-            return 0;
+            // Keep the frame shown so its children (e.g. W3ManaBars' mana bar) still draw, but make its own art
+            // transparent. Written every frame, so nothing has to be remembered or restored later.
+            SetBarAlpha(self, 0);
+        } else {
+            SetBarAlpha(self, 0xFF);
         }
+        return shown;
     }
     return orig_Show(self, edx);
 }
@@ -158,15 +192,14 @@ static void Install(void)
 
     g_base = (u32)GetModuleHandleA("Game.dll");
     u32 build = GetGameBuild();
-    logf_("W3HideFullHP 1.0  Game.dll build %u", build);
+    logf_("W3HideFullHP 1.1  Game.dll build %u", build);
     for (size_t i = 0; i < sizeof kAddrs / sizeof kAddrs[0]; i++) if (kAddrs[i].build == build) A = &kAddrs[i];
     if (!g_base || !A) { logf_("unsupported game version, doing nothing (need 1.27b, Game.dll 1.27.1.7085)"); return; }
     g_size = ImageSize(g_base);
     u32 vt = g_base + A->vtStatBar;
     if (!g_size || IsBadReadPtr((void*)vt, 0x80)) { logf_("health bar class not found"); return; }
     orig_Show = (Show_t)*(u32*)(vt + 0x68);
-    orig_Hide = (Show_t)*(u32*)(vt + 0x64);
-    if (!orig_Show || !orig_Hide) { logf_("health bar show/hide not found"); return; }
+    if (!orig_Show) { logf_("health bar show not found"); return; }
     u32 h = (u32)Show_hook;
     WriteMem(vt + 0x68, &h, 4);
     logf_("hiding health bars above %d%%", pct);

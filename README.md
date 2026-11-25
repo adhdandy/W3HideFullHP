@@ -11,7 +11,8 @@ Hides a unit's health bar while its HP is above a threshold, for **Warcraft III 
 
 This is a fork of [W3ManaBars](https://github.com/Hr0ffT/W3ManaBars) by [Hr0ffT](https://github.com/Hr0ffT),
 which draws mana bars under the health bars. All of the hook plumbing comes from there; the mana bar feature has
-been removed.
+been removed. Unlike the first version of this fork, W3HideFullHP **can be used together with W3ManaBars**: the
+mana bars stay visible even while the health bar above them is hidden.
 
 ## Requirements
 
@@ -35,7 +36,7 @@ All in `W3HideFullHP.ini`:
 | Setting | Default | What it does |
 |---|---|---|
 | `HideAbovePercent` | 95 | Hide a bar while HP is above this percentage (1..100). A unit at *exactly* this percentage still shows its bar, i.e. the comparison is strict `>`. `100` = never hide |
-| `Debug` | 0 | 1 = write `W3HideFullHP.log` next to the game (bar show/suppress counters every 3 s, for bug reports) |
+| `Debug` | 0 | 1 = write `W3HideFullHP.log` next to the game (bar show / made-transparent counters every 3 s, for bug reports) |
 
 A missing `.ini`, a missing key or an unreadable value falls back to the default. Values outside 1..100 are
 clamped, and the clamp is logged when `Debug=1`.
@@ -49,8 +50,15 @@ into "this bar is visible", and it is called on every bar on every frame.
 
 The mod hooks `Show`. For a unit health bar it reads the same HP fraction the game uses to fill the bar
 (`life / max life`, the same two unit fields the JASS `GetUnitLife` / `GetUnitMaxLife` states read) and, if that
-fraction is above the threshold, it refuses the show and hides the bar the way the game itself hides one
-(`WANT` = 0 plus the game's own `Hide`). Otherwise it falls straight through to the game's `Show`.
+fraction is above the threshold, it makes the bar's own art transparent: the frame alpha byte (`+0x88`) is set to
+0 and the bar's two art objects (the fill and its black backing) are refreshed through the engine's own
+alpha-recompute slot so the change is picked up immediately. It deliberately does **not** hide the frame.
+
+That distinction is what makes the mod work alongside [W3ManaBars](https://github.com/Hr0ffT/W3ManaBars): a
+`CStatBar` is a frame and can have child frames, and hiding a frame also hides its children. W3ManaBars attaches
+its mana bar as a child of the health bar, so hiding the health bar made the mana bars disappear too. Keeping the
+frame shown and only making its own art transparent leaves the child mana bar visible, and the game keeps ticking
+the health bar so W3ManaBars keeps updating it. Otherwise the alpha is put back to opaque.
 
 Because this is a per-frame, stateless decision:
 
